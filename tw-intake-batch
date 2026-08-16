@@ -1,0 +1,64 @@
+#!/bin/bash
+# tw-intake-batch — 把一份 URL 清單逐筆交給 tw-intake 翻譯，序列化處理。
+# 為什麼要序列化：tw-intake 開頭會 /clear 共用 session，連續丟會打斷上一篇；
+# 故「送一篇 → 等它在 twitter_article repo 出現新 commit（翻完會自動 git_sync）或逾時 → 再送下一篇」。
+# 用法： tw-intake-batch <清單檔>
+#   清單檔：每行一個 http(s) URL；# 開頭與空行略過。
+# 環境變數：TW_BATCH_DRY=1 只走流程不實際送（測試用）。
+set -u
+export PATH="/Users/chrishsu/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+REPO="/Users/chrishsu/Documents/twitter_article"
+LOG="/Users/chrishsu/.local/share/tw-intake.log"
+TW="/Users/chrishsu/.local/bin/tw-intake"
+BARK="$HOME/.claude/skills/bark/send.sh"
+PER_ITEM_TIMEOUT="${TW_BATCH_TIMEOUT:-1800}"   # 每篇最多等 30 分鐘
+POLL=15
+MAX_ITEMS=12                                    # 安全上限，防清單異常爆量
+DRY="${TW_BATCH_DRY:-0}"
+
+mkdir -p "$(dirname "$LOG")"
+log() { printf '%s  [batch] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
+
+LIST="${1:-}"
+[ -r "$LIST" ] || { echo "用法：tw-intake-batch <清單檔>" >&2; exit 1; }
+
+TMP="$(mktemp)"
+grep -E '^https?://' "$LIST" | awk '!seen[$0]++' | head -n "$MAX_ITEMS" > "$TMP"
+N=$(grep -c . "$TMP" | tr -d ' ')
+log "開始批次：${N} 篇（來源 ${LIST}，DRY=${DRY}）"
+[ "$N" -eq 0 ] && { log "清單無有效 URL，結束"; rm -f "$TMP"; exit 0; }
+
+count_commits() { git -C "$REPO" rev-list --count HEAD 2>/dev/null || echo 0; }
+
+i=0
+while IFS= read -r url; do
+  [ -z "$url" ] && continue
+  i=$((i + 1))
+  before="$(count_commits)"
+  log "($i/$N) 送出 $url"
+  if [ "$DRY" = "1" ]; then
+    log "($i/$N) DRY：略過實送與等待"
+    continue
+  fi
+  "$TW" "$url" >/dev/null 2>&1
+
+  waited=0; done=0
+  while [ "$waited" -lt "$PER_ITEM_TIMEOUT" ]; do
+    sleep "$POLL"; waited=$((waited + POLL))
+    after="$(count_commits)"
+    if [ "$after" -gt "$before" ]; then done=1; break; fi
+  done
+  if [ "$done" -eq 1 ]; then
+    log "($i/$N) ✓ 完成（等待 ${waited}s）"
+  else
+    log "($i/$N) ⏱ 逾時 ${PER_ITEM_TIMEOUT}s，跳下一篇"
+  fi
+done < "$TMP"
+rm -f "$TMP"
+
+log "批次結束：$N 篇"
+if [ "$DRY" != "1" ] && [ -x "$BARK" ]; then
+  "$BARK" "cc-radar 批次翻譯結束：$N 篇已逐筆處理" "翻譯批次 ✅" "twitter_article" \
+    "https://github.com/chrisincite/twitter_article" >/dev/null 2>&1 || true
+fi

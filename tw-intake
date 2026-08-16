@@ -1,0 +1,116 @@
+#!/bin/bash
+# tw-intake — 從 iPhone Shortcut 經 SSH 觸發：把一條連結灌進專用 tmux session 跑 twitter-article-zh
+# 用法： tw-intake <url>   （x.com/twitter.com、YouTube、或任何一般文章網址）
+#        tw-intake --easy <url>   （翻譯後再多產一篇 article-zh-easy.md）
+# 設計：idempotent（session 沒有就建、有就用）、依來源正規化、只收 http(s) URL、射後不理。
+# skill 的 fetch.sh 會再依 URL 自動分流：X→翻譯文(twitter_article) / YouTube→影片整理(youtubeKnow) / 一般網頁→翻譯文(twitter_article)。
+# note 模式（自動偵測，同一捷徑）：URL 指向 twitter_article 某篇 article-zh.md → 不翻譯，改跑 learning-note 在該篇文末加「寫成讀書筆記」預填連結。
+
+set -u
+
+# SSH 非登入 shell 的 PATH 可能很空，硬指死關鍵工具位置
+export PATH="/Users/chrishsu/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+SESSION="tw-intake"
+REPO_DIR="/Users/chrishsu/Documents/twitter_article"
+LOG="/Users/chrishsu/.local/share/tw-intake.log"
+mkdir -p "$(dirname "$LOG")"
+
+log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+
+URL="${1:-}"
+
+# --- 0a. 易讀模式：第一參數是 --easy → 主流程翻譯後，再跑 skill 的「輕鬆改寫分支」產出 article-zh-easy.md ---
+#     供 iPhone 另一個捷徑「推這篇＋易讀版」使用；其餘照常走單篇流程。
+MODE="full"
+if [[ "$URL" == "--easy" ]]; then
+  MODE="easy"; shift; URL="${1:-}"
+fi
+
+# --- 0. 批次模式：第一參數是清單檔（或 --list <檔>）→ 委派 tw-intake-batch 逐筆處理 ---
+#     iPhone Shortcut 送的是 http(s) URL（非既有檔案），會跳過此分支、走原本單篇流程。
+if [[ "$URL" == "--list" ]]; then
+  shift
+  exec /Users/chrishsu/.local/bin/tw-intake-batch "${1:-}"
+fi
+if [[ -n "$URL" && -f "$URL" ]]; then
+  exec /Users/chrishsu/.local/bin/tw-intake-batch "$URL"
+fi
+
+# --- 1. 驗證輸入：只收 http(s) URL，擋掉亂灌任意文字 ---
+if [[ -z "$URL" ]]; then
+  log "REJECT 空輸入"
+  echo "錯誤：沒有提供 URL" >&2
+  exit 1
+fi
+
+# --- 1b. learning-note 模式（自動偵測，同一捷徑不用改）---
+#     URL 指向 twitter_article 某篇 article-zh.md（github blob/tree/raw 或 raw.githubusercontent）
+#     → 不跑翻譯，改灌 /learning-note 在該篇譯文文末加「寫成讀書筆記」預填連結。
+if [[ "$MODE" == "full" ]] && { \
+     [[ "$URL" =~ ^https?://github\.com/chrisincite/twitter_article/(blob|tree|raw)/[^[:space:]]+/article-zh\.md$ ]] || \
+     [[ "$URL" =~ ^https?://raw\.githubusercontent\.com/chrisincite/twitter_article/[^[:space:]]+/article-zh\.md$ ]]; }; then
+  MODE="note"
+fi
+
+# --- 2. 依來源正規化 ---
+#   X：切掉 ?# 後的追蹤尾巴。
+#   YouTube：保留影片 ID，丟掉 &si/&list/&t 等追蹤參數（直接砍 ? 會連 v= 一起砍掉，URL 會壞）。
+#   一般網頁：只去 # 錨點、保留查詢字串（文章站的 ?id/?page 常是必要參數，不能盲砍）。
+if [[ "$MODE" == "note" ]]; then
+  CLEAN="$URL"                              # learning-note：blob 網址原樣傳給 add_note_links --only，別動它
+elif [[ "$URL" =~ ^https?://(www\.)?(x|twitter)\.com/ ]]; then
+  CLEAN="${URL%%\?*}"; CLEAN="${CLEAN%%#*}"
+elif [[ "$URL" =~ ^https?://(www\.|m\.)?youtube\.com/watch ]]; then
+  VID="$(printf '%s' "$URL" | sed -n 's/.*[?&]v=\([A-Za-z0-9_-][A-Za-z0-9_-]*\).*/\1/p')"
+  [[ -z "$VID" ]] && { log "REJECT youtube watch 無 v 參數：$URL"; echo "錯誤：YouTube 連結缺 v 參數" >&2; exit 1; }
+  CLEAN="https://www.youtube.com/watch?v=$VID"
+elif [[ "$URL" =~ ^https?://(www\.)?youtu\.be/([A-Za-z0-9_-]+) ]]; then
+  CLEAN="https://youtu.be/${BASH_REMATCH[2]}"
+elif [[ "$URL" =~ ^https?://(www\.|m\.)?youtube\.com/(shorts|live)/([A-Za-z0-9_-]+) ]]; then
+  CLEAN="https://www.youtube.com/${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+elif [[ "$URL" =~ ^https?://[^[:space:]]+ ]]; then
+  CLEAN="${URL%%#*}"
+else
+  log "REJECT 非 URL：$URL"
+  echo "錯誤：只接受 http(s) 開頭的網址" >&2
+  exit 1
+fi
+
+# --- 3. 確保專用 session 存在且 claude 跑著 ---
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  log "建立 session $SESSION 並冷啟動 claude"
+  tmux new-session -d -s "$SESSION" -c "$REPO_DIR"
+  tmux send-keys -t "$SESSION" 'claude --dangerously-skip-permissions' Enter
+  # 等 claude 開到提示符（冷啟動才需要）
+  sleep 8
+fi
+
+# --- 4. 先清掉上一篇的上下文，避免常駐 session 累積到爆 ---
+#    前提：上一篇已跑完、session 閒置（偶爾丟一篇的常態用法都成立）。
+#    若上一篇仍在跑，這個 /clear 可能打斷它——要連續批次丟多篇請改用「每篇獨立 session」架構。
+tmux send-keys -t "$SESSION" -l "/clear"
+sleep 1                                  # 等斜線指令選單渲染，避免 Enter 被選單吃成換行
+tmux send-keys -t "$SESSION" Enter
+sleep 0.5
+tmux send-keys -t "$SESSION" Enter       # 保險第二發：第一發若只關選單，這發才真正送出
+sleep 1
+
+# --- 5. 灌指令：-l 字面送出避免按鍵名被解讀；Enter 送兩發確保提交（單發常被斜線選單吃成換行）---
+#    full：只跑主流程翻譯。easy：主流程翻譯後，接著跑 skill 的「輕鬆改寫分支」多產一篇 article-zh-easy.md。
+if [[ "$MODE" == "note" ]]; then
+  CMD="/learning-note 為這篇 twitter_article 譯文加上「寫成讀書筆記」的預填連結：${CLEAN} 只做 SKILL.md「觸發機制：文章底部的『寫成讀書筆記』連結」那節的動作，不要走「你的路徑」的完整寫筆記流程。步驟：(1) 用 gh api 讀這篇 article-zh.md 全文；(2) 依規範寫好 digests/<slug>.md（摘要 2-3 段散文＋重點金句逐字照抄並 grep -F 核對，全形標點、不要分點）；(3) 執行 python3 ~/.claude/skills/learning-note/scripts/add_note_links.py --only \"${CLEAN}\" --apply 把預填連結插進該篇文末。絕對不要：寫筆記正文、揣測我的想法、向我提問（這是無人值守的自動觸發，沒人能回答，卡住就前功盡棄）、碰 chrisincite.github.io。腳本改的是遠端 twitter_article，做完後跑 git -C ~/Documents/twitter_article pull --rebase 讓本機 clone 跟上，避免下次翻譯 push 撞 non-fast-forward。最後 bark 通知我帶上文章連結。"
+elif [[ "$MODE" == "easy" ]]; then
+  CMD="/twitter-article-zh $CLEAN 完成主流程翻譯後，接著執行本 skill 的「輕鬆改寫分支」產生 article-zh-easy.md（1500-2000 中文字、口語輕鬆、純文字不放圖片），主流程與 easy 檔一起 push，bark 通知帶上文章連結。"
+else
+  CMD="/twitter-article-zh $CLEAN"
+fi
+
+tmux send-keys -t "$SESSION" -l "$CMD"
+sleep 1.5
+tmux send-keys -t "$SESSION" Enter
+sleep 0.7
+tmux send-keys -t "$SESSION" Enter
+
+log "SENT [$MODE] $CLEAN"
+echo "已送出（$MODE）：$CLEAN"
